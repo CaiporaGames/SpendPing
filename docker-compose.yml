@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  server:
+    build:
+      context: ./server
+    environment:
+      - PORT=4000
+    ports:
+      - "4000:4000"
+    networks: [spendnet]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks: [spendnet]
+
+  renderer:
+    image: grafana/grafana-image-renderer:latest
+    networks: [spendnet]
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      - prometheus
+      - renderer
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_RENDERING_SERVER_URL=http://renderer:8081/render
+      - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
+      - GF_UNIFIED_ALERTING_SCREENSHOTS_CAPTURE=true
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning
+      # On Windows, mount dashboards into provisioning to avoid /var/lib path issues
+      - ./ops/grafana/dashboards:/etc/grafana/provisioning/dashboards-json
+    ports:
+      - "3000:3000"
+    networks: [spendnet]
+
+networks:
+  spendnet: {}

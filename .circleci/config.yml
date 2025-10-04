@@ -1,0 +1,164 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@5.1.0
+
+executors:
+  android:
+    docker:
+      - image: cimg/android:2024.06
+    environment:
+      JAVA_TOOL_OPTIONS: -Xmx3g
+
+jobs:
+  lint:
+    docker:
+      - image: cimg/node:20.12
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-npm-{{ checksum "package-lock.json" }}
+      - run: npm ci
+      - save_cache:
+          key: v1-npm-{{ checksum "package-lock.json" }}
+          paths:
+            - node_modules
+      - run: npm run lint
+      - run: npm run format
+
+  typecheck:
+    docker:
+      - image: cimg/node:20.12
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-npm-{{ checksum "package-lock.json" }}
+      - run: npm ci
+      - run: npm run typecheck
+
+  test:
+    docker:
+      - image: cimg/node:20.12
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-npm-{{ checksum "package-lock.json" }}
+      - run: npm ci
+      - run: npm test
+
+  android-build:
+    executor: android
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-npm-{{ checksum "package-lock.json" }}
+      - run: npm ci
+      - run: npx expo prebuild -p android --no-install
+      - run:
+          name: Build APK
+          command: |
+            cd android
+            ./gradlew assembleRelease
+      - store_artifacts:
+          path: android/app/build/outputs/apk/release/app-release.apk
+          destination: spendping.apk
+
+  export-dashboard:
+    docker:
+      - image: cimg/node:20.12
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install docker compose plugin
+          command: |
+            mkdir -p ~/.docker/cli-plugins
+            curl -SL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
+              -o ~/.docker/cli-plugins/docker-compose
+            chmod +x ~/.docker/cli-plugins/docker-compose
+            docker compose version
+      - run:
+          name: Compose up (server + metrics stack)
+          command: |
+            docker compose up -d --build
+            docker ps
+      - run:
+          name: Wait for Grafana health
+          command: |
+            GRAFANA_CID=$(docker ps --filter "name=grafana" --format "{{.ID}}")
+            for i in $(seq 1 60); do
+              if docker exec "$GRAFANA_CID" sh -lc 'wget -qO- http://localhost:3000/api/health | grep -q "\"database\":\"ok\""'; then
+                echo "Grafana is healthy."
+                break
+              fi
+              echo "Waiting for Grafana... ($i/60)"; sleep 3
+            done
+      - run:
+          name: Seed metrics and wait for scrape
+          command: |
+            NET=$(docker network ls --format '{{.Name}}' | grep '_spendnet$' | head -n1)
+            echo "Using network: $NET"
+            for i in 1 2 3; do
+              docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                -s -H 'content-type: application/json' \
+                --data '{"query":"mutation { addExpense(amountCents:350, tag:\"coffee\", note:\"ci-seed\") { id } }"}' \
+                http://server:4000/graphql || true
+              docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                -s -X POST -H 'content-type: application/json' \
+                -d '{"type":"app_open","platform":"android"}' \
+                http://server:4000/events || true
+            done
+            sleep 20
+      - run:
+          name: Create Grafana API key
+          command: |
+            GRAFANA_CID=$(docker ps --filter "name=grafana" --format "{{.ID}}")
+            docker exec "$GRAFANA_CID" sh -lc \
+              'curl -s -u admin:admin -H "Content-Type: application/json" \
+              -X POST http://localhost:3000/api/auth/keys \
+              -d "{\"name\":\"ci\",\"role\":\"Admin\"}"' > key.json
+            cat key.json
+            node -e "console.log('API_KEY='+require('./key.json').key)" >> $BASH_ENV
+      - run:
+          name: Render dashboard (panel 1) to PNG
+          command: |
+            source $BASH_ENV
+            GRAFANA_CID=$(docker ps --filter "name=grafana" --format "{{.ID}}")
+            docker exec "$GRAFANA_CID" sh -lc \
+              "curl -f -H 'Authorization: Bearer ${API_KEY}' \
+              'http://localhost:3000/render/d-solo/spendping/SpendPing?panelId=1&width=1900&height=1000' \
+              -o /tmp/dashboard.png"
+            docker cp "$GRAFANA_CID:/tmp/dashboard.png" ./dashboard.png
+      - store_artifacts:
+          path: dashboard.png
+          destination: dashboard.png
+      - run:
+          name: Dump logs on failure
+          when: on_fail
+          command: |
+            docker ps -a
+            echo "---- server logs ----"; docker logs $(docker ps -aq --filter "name=server") || true
+            echo "---- grafana logs ----"; docker logs $(docker ps -aq --filter "name=grafana") || true
+            echo "---- prometheus logs ----"; docker logs $(docker ps -aq --filter "name=prometheus") || true
+
+workflows:
+  build_and_test:
+    jobs:
+      - lint
+      - typecheck:
+          requires:
+            - lint
+      - test:
+          requires:
+            - typecheck
+      - android-build:
+          requires:
+            - test
+      - export-dashboard:
+          requires:
+            - android-build
